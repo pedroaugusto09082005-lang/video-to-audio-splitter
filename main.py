@@ -1,62 +1,65 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import FileResponse
 import os
 import subprocess
 import tempfile
-import uuid
+import zipfile
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import FileResponse
 
-app = FastAPI(title="Video to MP3", version="1.0.0")
-
+app = FastAPI(title="Video to Audio (MP3 ZIP)")
 
 @app.get("/")
-def home():
-    return {"status": "ok", "message": "API online. Use POST /process com form-data file"}
-
-
-@app.get("/health")
 def health():
-    return {"ok": True}
-
+    return {"status": "ok", "message": "API online. Use POST /process com form-data file."}
 
 @app.post("/process")
 async def process_video(file: UploadFile = File(...)):
-    # Aceita qualquer vídeo, mas valida que veio algo
-    if not file or not file.filename:
-        raise HTTPException(status_code=400, detail="Envie um arquivo no campo 'file'")
+    # cria uma pasta temporária
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # caminhos
+        input_path = os.path.join(tmpdir, file.filename or "input.mp4")
+        mp3_path = os.path.join(tmpdir, "audio.mp3")
+        zip_path = os.path.join(tmpdir, "audio.zip")
 
-    workdir = tempfile.mkdtemp(prefix="job_")
-    input_path = os.path.join(workdir, f"input_{uuid.uuid4().hex}_{file.filename}")
-    output_path = os.path.join(workdir, "output.mp3")
+        # salva o arquivo recebido
+        content = await file.read()
+        if not content:
+            raise HTTPException(status_code=400, detail="Arquivo vazio.")
+        with open(input_path, "wb") as f:
+            f.write(content)
 
-    # salva upload no disco
-    with open(input_path, "wb") as f:
-        f.write(await file.read())
+        # converte para MP3 (1 arquivo só)
+        # 128k é um padrão bom (3 min ~ 3MB)
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i", input_path,
+            "-vn",
+            "-acodec", "libmp3lame",
+            "-b:a", "128k",
+            "-ar", "44100",
+            "-ac", "2",
+            mp3_path
+        ]
 
-    # Converte para MP3 (tamanho bom e qualidade boa)
-    # 128k = ~3MB em 3 minutos (aprox). Se quiser mais qualidade, muda para 192k.
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i", input_path,
-        "-vn",
-        "-acodec", "libmp3lame",
-        "-b:a", "128k",
-        "-ar", "44100",
-        output_path,
-    ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Erro ao executar ffmpeg: {str(e)}")
 
-    try:
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if result.returncode != 0:
+            # manda o log do ffmpeg pra você enxergar o erro
             raise HTTPException(
                 status_code=500,
-                detail=f"Erro no ffmpeg: {result.stderr[-800:]}"
+                detail=f"FFmpeg falhou.\nSTDERR:\n{result.stderr}"
             )
-    except FileNotFoundError:
-        raise HTTPException(status_code=500, detail="ffmpeg não encontrado no container")
 
-    return FileResponse(
-        output_path,
-        media_type="audio/mpeg",
-        filename="audio.mp3"
-    )
+        # cria ZIP com o mp3 dentro
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+            z.write(mp3_path, arcname="audio.mp3")
+
+        # retorna o ZIP
+        return FileResponse(
+            zip_path,
+            media_type="application/zip",
+            filename="audio.zip"
+        )
