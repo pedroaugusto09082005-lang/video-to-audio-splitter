@@ -1,42 +1,60 @@
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import FileResponse
 import os
-import uuid
 import shutil
 import subprocess
-from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import FileResponse
+import uuid
 
-app = FastAPI()
+app = FastAPI(title="Video to Audio (single MP3)")
+
+@app.get("/")
+def home():
+    return {"status": "ok", "hint": "Use POST /process with form-data field 'file' (video)"}
 
 @app.post("/process")
 async def process_video(file: UploadFile = File(...)):
+    # valida
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Arquivo inválido")
+
+    # cria pasta temporária
     job_id = str(uuid.uuid4())
     workdir = f"/tmp/{job_id}"
     os.makedirs(workdir, exist_ok=True)
 
-    input_path = f"{workdir}/{file.filename}"
+    # salva o vídeo recebido
+    input_path = os.path.join(workdir, file.filename)
+    with open(input_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
 
-    with open(input_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    # saída mp3 única
+    output_path = os.path.join(workdir, "audio.mp3")
 
-    output_pattern = f"{workdir}/part_%03d.mp3"
-
-    command = [
+    # ffmpeg: extrai áudio inteiro (mono 16k, leve pra transcrição)
+    cmd = [
         "ffmpeg",
+        "-y",
         "-i", input_path,
         "-vn",
-        "-acodec", "libmp3lame",
-        "-f", "segment",
-        "-segment_time", "300",
-        output_pattern
+        "-ac", "1",
+        "-ar", "16000",
+        "-b:a", "64k",
+        output_path
     ]
 
-    subprocess.run(command, check=True)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise HTTPException(
+                status_code=500,
+                detail=f"FFmpeg falhou: {proc.stderr[-1200:]}"
+            )
+    except FileNotFoundError:
+        raise HTTPException(status_code=500, detail="FFmpeg não encontrado no container")
 
-    zip_path = f"/tmp/{job_id}.zip"
-    shutil.make_archive(zip_path.replace(".zip", ""), "zip", workdir)
-
+    # devolve o arquivo mp3 (download direto)
     return FileResponse(
-        zip_path,
-        media_type="application/zip",
-        filename="audio_parts.zip"
+        output_path,
+        media_type="audio/mpeg",
+        filename="audio.mp3"
     )
