@@ -1,34 +1,42 @@
-from fastapi import FastAPI, UploadFile, File
-import subprocess
 import os
 import uuid
+import shutil
+import subprocess
+from fastapi import FastAPI, UploadFile, File
+from fastapi.responses import FileResponse
 
 app = FastAPI()
 
 @app.post("/process")
 async def process_video(file: UploadFile = File(...)):
-    uid = str(uuid.uuid4())
-    input_path = f"/tmp/{uid}.mp4"
-    output_dir = f"/tmp/{uid}"
-    os.makedirs(output_dir, exist_ok=True)
+    job_id = str(uuid.uuid4())
+    workdir = f"/tmp/{job_id}"
+    os.makedirs(workdir, exist_ok=True)
 
-    with open(input_path, "wb") as f:
-        f.write(await file.read())
+    input_path = f"{workdir}/{file.filename}"
+
+    with open(input_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    output_pattern = f"{workdir}/part_%03d.mp3"
 
     command = [
         "ffmpeg",
         "-i", input_path,
         "-vn",
-        "-ac", "1",
-        "-ar", "16000",
+        "-acodec", "libmp3lame",
         "-f", "segment",
-        "-segment_time", "600",
-        f"{output_dir}/part_%03d.mp3"
+        "-segment_time", "300",
+        output_pattern
     ]
 
     subprocess.run(command, check=True)
 
-    files = sorted(os.listdir(output_dir))
-    return {
-        "parts": files
-    }
+    zip_path = f"/tmp/{job_id}.zip"
+    shutil.make_archive(zip_path.replace(".zip", ""), "zip", workdir)
+
+    return FileResponse(
+        zip_path,
+        media_type="application/zip",
+        filename="audio_parts.zip"
+    )
