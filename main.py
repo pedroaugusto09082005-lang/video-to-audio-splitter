@@ -1,65 +1,89 @@
 import os
+import shutil
 import subprocess
 import tempfile
-import zipfile
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import FileResponse
+from pathlib import Path
 
-app = FastAPI(title="Video to Audio (MP3 ZIP)")
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse, FileResponse
+
+app = FastAPI(title="video-to-audio-splitter", version="1.0.0")
+
 
 @app.get("/")
+def root():
+    # Isso evita o 502 quando você abre o link no navegador
+    return {"status": "ok", "service": "video-to-audio-splitter"}
+
+
+@app.get("/health")
 def health():
-    return {"status": "ok", "message": "API online. Use POST /process com form-data file."}
+    return {"ok": True}
+
+
+def _run(cmd: list[str]) -> None:
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if p.returncode != 0:
+        raise RuntimeError(p.stderr.strip() or "ffmpeg failed")
+
 
 @app.post("/process")
 async def process_video(file: UploadFile = File(...)):
-    # cria uma pasta temporária
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # caminhos
-        input_path = os.path.join(tmpdir, file.filename or "input.mp4")
-        mp3_path = os.path.join(tmpdir, "audio.mp3")
-        zip_path = os.path.join(tmpdir, "audio.zip")
+    """
+    Recebe um vídeo e retorna um ZIP contendo 1 arquivo MP3 (audio.mp3).
+    """
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Arquivo inválido (sem nome).")
 
-        # salva o arquivo recebido
-        content = await file.read()
-        if not content:
-            raise HTTPException(status_code=400, detail="Arquivo vazio.")
-        with open(input_path, "wb") as f:
+    # pasta temporária segura
+    workdir = Path(tempfile.mkdtemp(prefix="v2a_"))
+    try:
+        input_path = workdir / f"input{Path(file.filename).suffix.lower() or '.mp4'}"
+        mp3_path = workdir / "audio.mp3"
+        zip_path = workdir / "audio.zip"
+
+        # salva upload em disco
+        with input_path.open("wb") as f:
+            content = await file.read()
             f.write(content)
 
-        # converte para MP3 (1 arquivo só)
-        # 128k é um padrão bom (3 min ~ 3MB)
+        # ffmpeg: extrai áudio como MP3
+        # -vn: remove vídeo
+        # -b:a 128k: qualidade boa e tamanho baixo (pode mudar depois)
         cmd = [
             "ffmpeg",
             "-y",
-            "-i", input_path,
+            "-i", str(input_path),
             "-vn",
             "-acodec", "libmp3lame",
             "-b:a", "128k",
-            "-ar", "44100",
-            "-ac", "2",
-            mp3_path
+            str(mp3_path),
         ]
 
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            _run(cmd)
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Erro ao executar ffmpeg: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Erro no ffmpeg: {str(e)}")
 
-        if result.returncode != 0:
-            # manda o log do ffmpeg pra você enxergar o erro
-            raise HTTPException(
-                status_code=500,
-                detail=f"FFmpeg falhou.\nSTDERR:\n{result.stderr}"
-            )
+        if not mp3_path.exists() or mp3_path.stat().st_size == 0:
+            raise HTTPException(status_code=500, detail="MP3 não foi gerado.")
 
-        # cria ZIP com o mp3 dentro
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
-            z.write(mp3_path, arcname="audio.mp3")
+        # cria ZIP com o MP3 (porque você disse que ZIP estava funcionando melhor)
+        shutil.make_archive(str(zip_path.with_suffix("")), "zip", root_dir=str(workdir), base_dir="audio.mp3")
 
-        # retorna o ZIP
+        if not zip_path.exists():
+            raise HTTPException(status_code=500, detail="ZIP não foi gerado.")
+
+        # devolve o ZIP
         return FileResponse(
-            zip_path,
+            path=str(zip_path),
             media_type="application/zip",
-            filename="audio.zip"
+            filename="audio.zip",
         )
+
+    finally:
+        # limpeza (Railway é stateless, melhor limpar)
+        try:
+            shutil.rmtree(workdir, ignore_errors=True)
+        except Exception:
+            pass
